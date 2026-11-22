@@ -6,9 +6,11 @@ tempo, substituindo o "Escutar este dispositivo" do Windows (que só aceita 1).
 
 Requisitos: Windows + Python 3.9+  ->  pip install sounddevice numpy
 """
+import ctypes
 import json
 import multiprocessing as mp
 import os
+import queue
 import sys
 import threading
 import time
@@ -227,6 +229,64 @@ def save_config(cfg):
 
 
 # --------------------------------------------------------------------------
+# Bandeja, iniciar com o Windows, instância única
+# --------------------------------------------------------------------------
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_MUTEX = None
+
+
+def startup_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --minimized'
+    pyw = Path(sys.executable).with_name("pythonw.exe")
+    exe = pyw if pyw.exists() else Path(sys.executable)
+    return f'"{exe}" "{Path(__file__).resolve()}" --minimized'
+
+
+def startup_enabled():
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, APP_NAME)
+        return True
+    except Exception:
+        return False
+
+
+def set_startup(on):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, startup_command())
+        else:
+            try:
+                winreg.DeleteValue(k, APP_NAME)
+            except FileNotFoundError:
+                pass
+
+
+def already_running():
+    global _MUTEX
+    try:
+        k = ctypes.windll.kernel32
+        _MUTEX = k.CreateMutexW(None, False, "GoXLRDualFones_SingleInstance")
+        return k.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    except Exception:
+        return False
+
+
+def make_icon_image():
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.rounded_rectangle((2, 2, 62, 62), radius=14, fill=(30, 30, 36, 255))
+    d.arc((12, 10, 52, 50), 180, 360, fill=(255, 255, 255, 255), width=4)
+    d.ellipse((9, 26, 26, 48), fill=(83, 252, 24, 255))
+    d.ellipse((38, 26, 55, 48), fill=(83, 252, 24, 255))
+    return img
+
+
+# --------------------------------------------------------------------------
 # Interface
 # --------------------------------------------------------------------------
 class Slot:
@@ -241,7 +301,7 @@ class Slot:
 
 
 class App:
-    def __init__(self, root, sd):
+    def __init__(self, root, sd, minimized=False):
         import tkinter as tk
         from tkinter import ttk
 
@@ -249,6 +309,10 @@ class App:
         self.cfg = load_config()
         self.status_q = mp.Queue()
         self.running = False
+        self.cmd_q = queue.Queue()
+        self.notified = False
+        self.tray = None
+        self.startup = tk.BooleanVar(value=startup_enabled())
         self.slots = [Slot(tk, self.cfg, 1), Slot(tk, self.cfg, 2)]
 
         root.title(APP_NAME)
@@ -291,18 +355,33 @@ class App:
         self.auto = tk.BooleanVar(value=self.cfg.get("autostart", False))
         ttk.Checkbutton(bar, text="Ligar automaticamente ao abrir",
                         variable=self.auto).grid(row=0, column=2, padx=6)
+        ttk.Checkbutton(bar, text="Iniciar com o Windows (já ligado, escondido na bandeja)",
+                        variable=self.startup, command=self.on_startup).grid(
+            row=1, column=0, columnspan=3, pady=(8, 0))
 
         tips = ("Dicas:\n"
                 "• Desative \"Escutar este dispositivo\" do Broadcast Stream Mix no Windows\n"
                 "  (senão você ouve em dobro).\n"
                 "• Em fones Bluetooth escolha a opção \"Stereo\", não \"Hands-Free\".\n"
-                "• Fone novo/religado que não aparece? Clique em \"Atualizar lista\".")
+                "• Fone novo/religado que não aparece? Clique em \"Atualizar lista\".\n"
+                "• O X da janela manda o programa para a bandeja (perto do relógio).\n"
+                "  Para fechar de vez: ícone da bandeja → Sair.")
         ttk.Label(frm, text=tips, foreground="#555", justify="left").grid(
             row=6, column=0, columnspan=3, sticky="w", **pad)
 
-        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.setup_tray()
+        if startup_enabled():
+            try:
+                set_startup(True)  # atualiza o caminho caso o .exe tenha sido movido
+            except Exception:
+                pass
+        root.protocol("WM_DELETE_WINDOW", self.hide)
         root.after(300, self.poll)
-        if self.auto.get():
+        if minimized:
+            if self.tray is not None:
+                root.withdraw()
+            root.after(600, self.toggle)  # iniciado pelo Windows: já ativo
+        elif self.auto.get():
             root.after(600, self.toggle)
 
     # ---- controle ----
@@ -378,7 +457,61 @@ class App:
                     self.slots[slot].status.set(msg)
         except Exception:
             pass
+        try:
+            while True:
+                cmd = self.cmd_q.get_nowait()
+                if cmd == "show":
+                    self.show()
+                elif cmd == "toggle":
+                    self.toggle()
+                elif cmd == "quit":
+                    self.quit()
+                    return
+        except queue.Empty:
+            pass
         self.root.after(300, self.poll)
+
+    # ---- bandeja ----
+    def setup_tray(self):
+        try:
+            import pystray
+            menu = pystray.Menu(
+                pystray.MenuItem("Abrir", lambda i, it: self.cmd_q.put("show"), default=True),
+                pystray.MenuItem(lambda it: "Desligar" if self.running else "Ligar",
+                                 lambda i, it: self.cmd_q.put("toggle")),
+                pystray.MenuItem("Sair", lambda i, it: self.cmd_q.put("quit")),
+            )
+            self.tray = pystray.Icon(APP_NAME, make_icon_image(), APP_NAME, menu)
+            self.tray.run_detached()
+        except Exception:
+            self.tray = None  # sem bandeja: o X fecha o programa
+
+    def show(self):
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def hide(self):
+        if self.tray is None:
+            self.quit()
+            return
+        self.root.withdraw()
+        if not self.notified:
+            self.notified = True
+            try:
+                self.tray.notify("Continua funcionando aqui na bandeja. "
+                                 "Clique com o botão direito → Sair para fechar.", APP_NAME)
+            except Exception:
+                pass
+
+    def on_startup(self):
+        try:
+            set_startup(self.startup.get())
+        except Exception as e:  # noqa: BLE001
+            self.startup.set(not self.startup.get())
+            from tkinter import messagebox
+            messagebox.showerror(APP_NAME, f"Não consegui alterar a inicialização com o Windows:\n{e}")
+        self.save()
 
     def save(self):
         save_config({
@@ -389,19 +522,33 @@ class App:
             "autostart": self.auto.get(),
         })
 
-    def close(self):
+    def quit(self):
         self.running = False
         for i in range(2):
             self.stop_slot(i)
         self.save()
+        if self.tray is not None:
+            try:
+                self.tray.stop()
+            except Exception:
+                pass
         self.root.destroy()
 
 
 def run_gui():
     import tkinter as tk
+    from tkinter import messagebox
+    minimized = "--minimized" in sys.argv
+    if already_running():
+        if not minimized:
+            r = tk.Tk()
+            r.withdraw()
+            messagebox.showinfo(APP_NAME, "O programa já está aberto.\n"
+                                "Procure o ícone na bandeja do Windows (perto do relógio).")
+        return
     import sounddevice as sd
     root = tk.Tk()
-    App(root, sd)
+    App(root, sd, minimized=minimized)
     root.mainloop()
 
 
