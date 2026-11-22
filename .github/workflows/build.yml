@@ -1,0 +1,29 @@
+name: Gerar EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Instalar dependências
+        run: pip install sounddevice numpy pyinstaller
+
+      - name: Gerar o executável
+        run: |
+          copy goxlr_dual_fones.pyw app.py
+          pyinstaller --onefile --windowed --name GoXLR_Dual_Fones --collect-all sounddevice --collect-all _sounddevice_data app.py
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: GoXLR_Dual_Fones
+          path: dist/GoXLR_Dual_Fones.exe
